@@ -22,11 +22,50 @@ IS_WINDOWS = sys.platform == "win32"
 CLAUDE_DIR = Path.home() / ".claude"
 HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
+SETTINGS_FILE = CLAUDE_DIR / "cl-settings.json"
 
 CLAUDE_BIN = "claude"
-BASE_FLAGS = ["--dangerously-skip-permissions"]
 TMUX_PREFIX = "cl/"
-HAS_TMUX = not IS_WINDOWS and which("tmux") is not None
+TMUX_AVAILABLE = not IS_WINDOWS and which("tmux") is not None
+
+# Setting definitions: key -> (label, description, default)
+SETTING_DEFS = {
+    "use_tmux": ("tmux wrapping", "Wrap sessions in tmux for SSH attach", True),
+    "skip_permissions": ("skip permissions", "--dangerously-skip-permissions flag", True),
+}
+
+
+# --- settings ---
+
+
+def load_settings():
+    """Load settings from disk, falling back to defaults."""
+    defaults = {k: v[2] for k, v in SETTING_DEFS.items()}
+    if not SETTINGS_FILE.exists():
+        return defaults
+    try:
+        with open(SETTINGS_FILE) as f:
+            saved = json.loads(f.read())
+        return {**defaults, **saved}
+    except (json.JSONDecodeError, OSError):
+        return defaults
+
+
+def save_settings(settings):
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(settings, f, indent=2)
+
+
+def use_tmux():
+    return TMUX_AVAILABLE and load_settings().get("use_tmux", True)
+
+
+def get_base_flags():
+    flags = []
+    if load_settings().get("skip_permissions", True):
+        flags.append("--dangerously-skip-permissions")
+    return flags
 
 
 # --- launch (no tmux) ---
@@ -35,9 +74,8 @@ HAS_TMUX = not IS_WINDOWS and which("tmux") is not None
 def launch_claude(project_dir, claude_args):
     """Launch claude directly, replacing this process."""
     os.chdir(project_dir)
-    cmd = [CLAUDE_BIN] + BASE_FLAGS + list(claude_args)
+    cmd = [CLAUDE_BIN] + get_base_flags() + list(claude_args)
     if IS_WINDOWS:
-        # os.execvp on Windows spawns a child; use subprocess for cleaner exit
         sys.exit(subprocess.call(cmd))
     else:
         os.execvp(CLAUDE_BIN, cmd)
@@ -65,7 +103,7 @@ def tmux_session_exists(name):
 
 def get_live_sessions():
     """Return dict of active cl/ tmux sessions: name -> info."""
-    if not HAS_TMUX:
+    if not use_tmux():
         return {}
 
     result = tmux("list-sessions", "-F", "#{session_name}\t#{session_attached}")
@@ -118,7 +156,7 @@ def create_and_enter_tmux(project_dir, claude_args, claude_sid=None):
     clients kills it immediately.
     """
     name = make_tmux_name(project_dir)
-    cmd_str = " ".join(shlex.quote(a) for a in [CLAUDE_BIN] + BASE_FLAGS + list(claude_args))
+    cmd_str = " ".join(shlex.quote(a) for a in [CLAUDE_BIN] + get_base_flags() + list(claude_args))
 
     subprocess.run(
         ["tmux", "new-session", "-d", "-s", name, "-c", project_dir, cmd_str],
@@ -387,22 +425,42 @@ def build_picker_lines(live, history, cwd):
     return lines
 
 
+def build_settings_lines():
+    """Build fzf lines for the settings panel."""
+    settings = load_settings()
+    lines = []
+    for key, (label, desc, _default) in SETTING_DEFS.items():
+        val = settings.get(key, _default)
+        # Grey out tmux option if tmux isn't installed
+        if key == "use_tmux" and not TMUX_AVAILABLE:
+            indicator = "\x1b[2m---\x1b[0m"
+            note = f"\x1b[2m{label}  (tmux not installed)\x1b[0m"
+        elif val:
+            indicator = "\x1b[32m ON\x1b[0m"
+            note = f"{label}  \x1b[2m{desc}\x1b[0m"
+        else:
+            indicator = "\x1b[31mOFF\x1b[0m"
+            note = f"{label}  \x1b[2m{desc}\x1b[0m"
+        lines.append(f"SET:{key}\t  [{indicator}]  {note}")
+    return lines
+
+
 def run_fzf(lines):
-    """Show fzf picker with live reload, return selected key or None."""
-    # Build the reload command: wait 2s then regenerate lines
+    """Show fzf session picker with live reload, return selected key or None."""
     script = shlex.quote(os.path.abspath(sys.argv[0]))
     python = shlex.quote(sys.executable)
-    # Use --delay so the sleep is cross-platform (no reliance on sleep cmd)
     reload_cmd = f"{python} {script} --picker-lines --delay"
+    settings_cmd = f"{python} {script} --settings"
 
     try:
         result = subprocess.run(
             [
                 "fzf", "--ansi", "--no-sort",
-                "--header", " Claude Code Sessions",
+                "--header", " Sessions  [tab: settings]",
                 "--delimiter", "\t", "--with-nth", "2..",
                 "--height", "~50%", "--reverse",
                 "--bind", f"load:reload({reload_cmd})",
+                "--bind", f"tab:become({settings_cmd})",
             ],
             input="\n".join(lines),
             stdout=subprocess.PIPE,
@@ -423,12 +481,38 @@ def run_fzf(lines):
     return result.stdout.strip().split("\t")[0]
 
 
+def run_settings_fzf():
+    """Show fzf settings panel. Returns to session picker on Tab."""
+    script = shlex.quote(os.path.abspath(sys.argv[0]))
+    python = shlex.quote(sys.executable)
+    sessions_cmd = f"{python} {script}"
+    toggle_cmd = f"{python} {script} --toggle {{1}}"
+    reload_cmd = f"{python} {script} --settings-lines"
+
+    lines = build_settings_lines()
+    try:
+        subprocess.run(
+            [
+                "fzf", "--ansi", "--no-sort",
+                "--header", " Settings  [tab: sessions]  [enter: toggle]",
+                "--delimiter", "\t", "--with-nth", "2..",
+                "--height", "~50%", "--reverse",
+                "--bind", f"tab:become({sessions_cmd})",
+                "--bind", f"enter:execute-silent({toggle_cmd})+reload({reload_cmd})",
+            ],
+            input="\n".join(lines),
+            text=True,
+        )
+    except FileNotFoundError:
+        pass
+
+
 # --- main ---
 
 
 def start_session(project_dir, claude_args, claude_sid=None):
     """Start a claude session — in tmux if available, direct otherwise."""
-    if HAS_TMUX:
+    if use_tmux():
         create_and_enter_tmux(project_dir, claude_args, claude_sid)
     else:
         launch_claude(project_dir, claude_args)
@@ -444,6 +528,32 @@ def main():
         live = get_live_sessions()
         cwd = os.getcwd()
         print("\n".join(build_picker_lines(live, history, cwd)))
+        return
+
+    # Internal: print settings lines to stdout (used by fzf reload)
+    if "--settings-lines" in sys.argv:
+        print("\n".join(build_settings_lines()))
+        return
+
+    # Internal: toggle a setting
+    if "--toggle" in sys.argv:
+        idx = sys.argv.index("--toggle")
+        if idx + 1 < len(sys.argv):
+            raw_key = sys.argv[idx + 1]
+            # fzf passes "SET:key", strip the prefix
+            key = raw_key.removeprefix("SET:")
+            if key in SETTING_DEFS:
+                # Don't allow toggling tmux if it's not installed
+                if key == "use_tmux" and not TMUX_AVAILABLE:
+                    return
+                settings = load_settings()
+                settings[key] = not settings.get(key, SETTING_DEFS[key][2])
+                save_settings(settings)
+        return
+
+    # Settings panel
+    if "--settings" in sys.argv:
+        run_settings_fzf()
         return
 
     # Pass-through: args go straight to claude
