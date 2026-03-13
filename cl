@@ -495,23 +495,21 @@ def build_settings_lines():
     return lines
 
 
-def run_fzf(lines):
-    """Show fzf session picker with live reload, return selected key or None."""
-    script = shlex.quote(os.path.abspath(sys.argv[0]))
-    python = shlex.quote(sys.executable)
-    reload_cmd = f"{python} {script} --picker-lines --delay"
-    settings_cmd = f"{python} {script} --settings"
+def _run_fzf(lines, header, extra_binds=None):
+    """Run fzf with --expect=tab, return (pressed_key, selected_key) or (None, None)."""
+    fzf_args = [
+        "fzf", "--ansi", "--no-sort",
+        "--header", header,
+        "--delimiter", "\t", "--with-nth", "2..",
+        "--height", "~50%", "--reverse",
+        "--expect", "tab",
+    ]
+    for bind in (extra_binds or []):
+        fzf_args += ["--bind", bind]
 
     try:
         result = subprocess.run(
-            [
-                "fzf", "--ansi", "--no-sort",
-                "--header", " Sessions  [tab: settings]",
-                "--delimiter", "\t", "--with-nth", "2..",
-                "--height", "~50%", "--reverse",
-                "--bind", f"load:reload-sync({reload_cmd})",
-                "--bind", f"tab:become({settings_cmd})",
-            ],
+            fzf_args,
             input="\n".join(lines),
             stdout=subprocess.PIPE,
             text=True,
@@ -527,74 +525,75 @@ def run_fzf(lines):
         sys.exit(1)
 
     if result.returncode != 0 or not result.stdout.strip():
-        return None
-    return result.stdout.strip().split("\t")[0]
+        return None, None
+
+    out = result.stdout.strip().split("\n")
+    pressed = out[0] if out else ""
+    selected = out[1].split("\t")[0] if len(out) > 1 else ""
+    return pressed, selected
 
 
-def run_settings_fzf():
-    """Show fzf settings panel in a loop. Handles toggles and editor directly."""
+def run_picker_loop():
+    """Main UI loop: sessions picker <-> settings panel, all in Python."""
     script = shlex.quote(os.path.abspath(sys.argv[0]))
     python = shlex.quote(sys.executable)
+    reload_cmd = f"load:reload-sync({python} {script} --picker-lines --delay)"
+
+    mode = "sessions"
 
     while True:
-        _settings_cache_reset()
-        try:
-            result = subprocess.run(
-                [
-                    "fzf", "--ansi", "--no-sort",
-                    "--header", " Settings  [tab: sessions]  [enter: toggle/edit]",
-                    "--delimiter", "\t", "--with-nth", "2..",
-                    "--height", "~50%", "--reverse",
-                    "--expect", "tab",
-                ],
-                input="\n".join(build_settings_lines()),
-                stdout=subprocess.PIPE,
-                text=True,
+        if mode == "sessions":
+            history = get_history_sessions()
+            live = get_live_sessions()
+            cwd = os.getcwd()
+            lines = build_picker_lines(live, history, cwd)
+
+            pressed, key = _run_fzf(
+                lines,
+                " Sessions  [tab: settings]",
+                extra_binds=[reload_cmd],
             )
-        except FileNotFoundError:
-            return
 
-        if result.returncode != 0:
-            return
+            if pressed is None:
+                return None  # Esc/ctrl-c
+            if pressed == "tab":
+                mode = "settings"
+                continue
+            return key  # session key selected
 
-        lines = result.stdout.strip().split("\n")
-        pressed = lines[0] if lines else ""
-        selected = lines[1].split("\t")[0] if len(lines) > 1 else ""
+        elif mode == "settings":
+            global _settings_cache
+            _settings_cache = None
 
-        if pressed == "tab":
-            # Switch back to sessions picker
-            os.execvp(sys.executable, [sys.executable, os.path.abspath(sys.argv[0])])
+            pressed, selected = _run_fzf(
+                build_settings_lines(),
+                " Settings  [tab: sessions]  [enter: toggle/edit]",
+            )
 
-        if selected.startswith("SET:"):
-            key = selected.removeprefix("SET:")
-            if key in TOGGLE_DEFS and not (key == "use_tmux" and not TMUX_AVAILABLE):
-                settings = load_settings()
-                settings[key] = not settings.get(key, TOGGLE_DEFS[key][2])
-                save_settings(settings)
-            # Loop back to show updated settings
+            if pressed is None:
+                return None  # Esc/ctrl-c
+            if pressed == "tab":
+                mode = "sessions"
+                continue
 
-        elif selected.startswith("EDIT:"):
-            SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            if not SETTINGS_FILE.exists():
-                save_settings(load_settings())
-            editor = os.environ.get("EDITOR", "vi" if not IS_WINDOWS else "notepad")
-            # Open editor with explicit TTY — stdin/stdout may be pipes
-            # from the fzf subprocess wiring, so we connect directly to /dev/tty
-            if IS_WINDOWS:
+            if selected.startswith("SET:"):
+                key = selected.removeprefix("SET:")
+                if key in TOGGLE_DEFS and not (key == "use_tmux" and not TMUX_AVAILABLE):
+                    settings = load_settings()
+                    settings[key] = not settings.get(key, TOGGLE_DEFS[key][2])
+                    save_settings(settings)
+                # stay in settings mode
+
+            elif selected.startswith("EDIT:"):
+                SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+                if not SETTINGS_FILE.exists():
+                    save_settings(load_settings())
+                editor = os.environ.get("EDITOR", "vi" if not IS_WINDOWS else "notepad")
                 subprocess.call([editor, str(SETTINGS_FILE)])
+                # stay in settings mode
+
             else:
-                tty = open("/dev/tty", "r+")
-                subprocess.call([editor, str(SETTINGS_FILE)], stdin=tty, stdout=tty, stderr=tty)
-                tty.close()
-            # Loop back to show updated settings
-
-        else:
-            return
-
-
-def _settings_cache_reset():
-    global _settings_cache
-    _settings_cache = None
+                return None
 
 
 # --- main ---
@@ -625,11 +624,6 @@ def main():
         print("\n".join(build_settings_lines()))
         return
 
-    # Settings panel
-    if "--settings" in args:
-        run_settings_fzf()
-        return
-
     # Self-update via git pull
     if "--update" in args:
         repo_dir = Path(__file__).resolve().parent
@@ -654,13 +648,12 @@ def main():
         start_session(os.getcwd(), [])
         return
 
-    cwd = os.getcwd()
-    key = run_fzf(build_picker_lines(live, history, cwd))
+    key = run_picker_loop()
 
     if key is None or key == "SEP":
         sys.exit(0)
     elif key == "NEW":
-        start_session(cwd, [])
+        start_session(os.getcwd(), [])
     elif key.startswith("TMUX:"):
         enter_tmux(key[5:])
     else:
