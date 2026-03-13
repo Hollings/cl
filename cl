@@ -388,7 +388,13 @@ def build_picker_lines(live, history, cwd):
 
 
 def run_fzf(lines):
-    """Show fzf picker, return selected key or None."""
+    """Show fzf picker with live reload, return selected key or None."""
+    # Build the reload command: wait 2s then regenerate lines
+    script = shlex.quote(os.path.abspath(sys.argv[0]))
+    python = shlex.quote(sys.executable)
+    # Use --delay so the sleep is cross-platform (no reliance on sleep cmd)
+    reload_cmd = f"{python} {script} --picker-lines --delay"
+
     try:
         result = subprocess.run(
             [
@@ -396,6 +402,7 @@ def run_fzf(lines):
                 "--header", " Claude Code Sessions",
                 "--delimiter", "\t", "--with-nth", "2..",
                 "--height", "~50%", "--reverse",
+                "--bind", f"load:reload({reload_cmd})",
             ],
             input="\n".join(lines),
             stdout=subprocess.PIPE,
@@ -428,6 +435,17 @@ def start_session(project_dir, claude_args, claude_sid=None):
 
 
 def main():
+    # Internal: print picker lines to stdout (used by fzf reload)
+    if "--picker-lines" in sys.argv:
+        if "--delay" in sys.argv:
+            import time
+            time.sleep(2)
+        history = get_history_sessions()
+        live = get_live_sessions()
+        cwd = os.getcwd()
+        print("\n".join(build_picker_lines(live, history, cwd)))
+        return
+
     # Pass-through: args go straight to claude
     if len(sys.argv) > 1:
         start_session(os.getcwd(), sys.argv[1:])
