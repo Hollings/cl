@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""cl - Claude Code session manager with tmux integration
+"""cl - Claude Code session manager
 
 Run without arguments to pick from recent sessions.
 Run with arguments to start a new session directly.
 
-Every session runs inside tmux so you can attach from SSH.
-Sessions auto-destroy when all terminals disconnect.
+On systems with tmux, sessions run inside tmux so you can attach from
+SSH. Sessions auto-destroy when all terminals disconnect.
+Without tmux, sessions launch directly (still get the picker).
 """
 
 import json
@@ -15,7 +16,9 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from shutil import which
 
+IS_WINDOWS = sys.platform == "win32"
 CLAUDE_DIR = Path.home() / ".claude"
 HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -23,6 +26,21 @@ PROJECTS_DIR = CLAUDE_DIR / "projects"
 CLAUDE_BIN = "claude"
 BASE_FLAGS = ["--dangerously-skip-permissions"]
 TMUX_PREFIX = "cl/"
+HAS_TMUX = not IS_WINDOWS and which("tmux") is not None
+
+
+# --- launch (no tmux) ---
+
+
+def launch_claude(project_dir, claude_args):
+    """Launch claude directly, replacing this process."""
+    os.chdir(project_dir)
+    cmd = [CLAUDE_BIN] + BASE_FLAGS + list(claude_args)
+    if IS_WINDOWS:
+        # os.execvp on Windows spawns a child; use subprocess for cleaner exit
+        sys.exit(subprocess.call(cmd))
+    else:
+        os.execvp(CLAUDE_BIN, cmd)
 
 
 # --- tmux ---
@@ -47,6 +65,9 @@ def tmux_session_exists(name):
 
 def get_live_sessions():
     """Return dict of active cl/ tmux sessions: name -> info."""
+    if not HAS_TMUX:
+        return {}
+
     result = tmux("list-sessions", "-F", "#{session_name}\t#{session_attached}")
     if result.returncode != 0:
         return {}
@@ -88,7 +109,7 @@ def enter_tmux(name):
         os.execvp("tmux", ["tmux", "attach-session", "-t", name])
 
 
-def create_and_enter(name, project_dir, claude_args, claude_sid=None):
+def create_and_enter_tmux(project_dir, claude_args, claude_sid=None):
     """Create a tmux session running claude, then attach.
 
     Uses a client-attached hook to enable destroy-unattached, so the
@@ -96,6 +117,7 @@ def create_and_enter(name, project_dir, claude_args, claude_sid=None):
     deferred because setting destroy-unattached on a session with zero
     clients kills it immediately.
     """
+    name = make_tmux_name(project_dir)
     cmd_str = " ".join(shlex.quote(a) for a in [CLAUDE_BIN] + BASE_FLAGS + list(claude_args))
 
     subprocess.run(
@@ -116,6 +138,8 @@ def create_and_enter(name, project_dir, claude_args, claude_sid=None):
 
 def encode_project_path(path):
     """Encode a path the way Claude Code names project directories."""
+    # Normalize Windows backslashes
+    path = path.replace("\\", "/")
     return path.replace("/", "-").replace(" ", "-").replace("~", "-")
 
 
@@ -230,7 +254,15 @@ def relative_time(ts_ms):
 
 def short_path(path):
     home = str(Path.home())
-    return "~" + path[len(home):] if path.startswith(home) else path
+    if path.startswith(home):
+        return "~" + path[len(home):]
+    # Windows: also try with normalized separators
+    if IS_WINDOWS:
+        norm_path = path.replace("/", "\\")
+        norm_home = home.replace("/", "\\")
+        if norm_path.startswith(norm_home):
+            return "~" + norm_path[len(norm_home):]
+    return path
 
 
 def truncate(text, length=50):
@@ -291,7 +323,13 @@ def run_fzf(lines):
             text=True,
         )
     except FileNotFoundError:
-        print("fzf required: brew install fzf")
+        print("fzf is required.")
+        if IS_WINDOWS:
+            print("  scoop install fzf  OR  winget install junegunn.fzf")
+        elif which("brew"):
+            print("  brew install fzf")
+        else:
+            print("  https://github.com/junegunn/fzf#installation")
         sys.exit(1)
 
     if result.returncode != 0 or not result.stdout.strip():
@@ -302,19 +340,25 @@ def run_fzf(lines):
 # --- main ---
 
 
+def start_session(project_dir, claude_args, claude_sid=None):
+    """Start a claude session — in tmux if available, direct otherwise."""
+    if HAS_TMUX:
+        create_and_enter_tmux(project_dir, claude_args, claude_sid)
+    else:
+        launch_claude(project_dir, claude_args)
+
+
 def main():
-    # Pass-through: args go straight to claude in a new tmux session
+    # Pass-through: args go straight to claude
     if len(sys.argv) > 1:
-        cwd = os.getcwd()
-        create_and_enter(make_tmux_name(cwd), cwd, sys.argv[1:])
+        start_session(os.getcwd(), sys.argv[1:])
 
     history = get_history_sessions()
     live = get_live_sessions()
 
     # Nothing to pick from — just launch
     if not history and not live:
-        cwd = os.getcwd()
-        create_and_enter(make_tmux_name(cwd), cwd, [])
+        start_session(os.getcwd(), [])
 
     cwd = os.getcwd()
     key = run_fzf(build_picker_lines(live, history, cwd))
@@ -322,7 +366,7 @@ def main():
     if key is None:
         sys.exit(0)
     elif key == "NEW":
-        create_and_enter(make_tmux_name(cwd), cwd, [])
+        start_session(cwd, [])
     elif key.startswith("TMUX:"):
         enter_tmux(key[5:])
     else:
@@ -330,8 +374,7 @@ def main():
         if not session:
             print(f"Session not found: {key}")
             sys.exit(1)
-        name = make_tmux_name(session["project"])
-        create_and_enter(name, session["project"], ["-r", key], claude_sid=key)
+        start_session(session["project"], ["-r", key], claude_sid=key)
 
 
 if __name__ == "__main__":
