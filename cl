@@ -38,23 +38,33 @@ SETTING_DEFS = {
 # --- settings ---
 
 
+_settings_cache = None
+
+
 def load_settings():
-    """Load settings from disk, falling back to defaults."""
+    """Load settings from disk, falling back to defaults. Cached per process."""
+    global _settings_cache
+    if _settings_cache is not None:
+        return _settings_cache
     defaults = {k: v[2] for k, v in SETTING_DEFS.items()}
     if not SETTINGS_FILE.exists():
+        _settings_cache = defaults
         return defaults
     try:
         with open(SETTINGS_FILE) as f:
             saved = json.loads(f.read())
-        return {**defaults, **saved}
+        _settings_cache = {**defaults, **saved}
     except (json.JSONDecodeError, OSError):
-        return defaults
+        _settings_cache = defaults
+    return _settings_cache
 
 
 def save_settings(settings):
+    global _settings_cache
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(SETTINGS_FILE, "w") as f:
         json.dump(settings, f, indent=2)
+    _settings_cache = None  # invalidate cache
 
 
 def use_tmux():
@@ -89,16 +99,22 @@ def tmux(*args):
     return subprocess.run(["tmux"] + list(args), capture_output=True, text=True)
 
 
-def tmux_env(session_name, var):
-    """Read a tmux environment variable, or None."""
-    result = tmux("show-environment", "-t", session_name, var)
-    if result.returncode == 0 and "=" in result.stdout:
-        return result.stdout.strip().split("=", 1)[1]
-    return None
-
-
 def tmux_session_exists(name):
-    return tmux("has-session", "-t", name).returncode == 0
+    # Use '=' prefix for exact match — without it, tmux does prefix matching
+    # (e.g., "cl/foo" would also match "cl/foobar")
+    return tmux("has-session", "-t", f"={name}").returncode == 0
+
+
+def tmux_env_all(session_name):
+    """Read all tmux environment variables for a session as a dict."""
+    result = tmux("show-environment", "-t", f"={session_name}")
+    env = {}
+    if result.returncode == 0:
+        for line in result.stdout.strip().split("\n"):
+            if "=" in line:
+                k, v = line.split("=", 1)
+                env[k] = v
+    return env
 
 
 def get_live_sessions():
@@ -116,10 +132,12 @@ def get_live_sessions():
             continue
         parts = line.split("\t")
         name = parts[0]
+        # Single subprocess per session instead of two separate tmux_env calls
+        env = tmux_env_all(name)
         sessions[name] = {
             "attached": len(parts) > 1 and parts[1] == "1",
-            "claude_sid": tmux_env(name, "CL_SID"),
-            "project": tmux_env(name, "CL_PROJECT") or "",
+            "claude_sid": env.get("CL_SID"),
+            "project": env.get("CL_PROJECT", ""),
         }
     return sessions
 
@@ -141,10 +159,11 @@ def make_tmux_name(project_path):
 
 def enter_tmux(name):
     """Attach to or switch to a tmux session (never returns)."""
+    target = f"={name}"  # exact match — tmux does prefix matching without '='
     if os.environ.get("TMUX"):
-        os.execvp("tmux", ["tmux", "switch-client", "-t", name])
+        os.execvp("tmux", ["tmux", "switch-client", "-t", target])
     else:
-        os.execvp("tmux", ["tmux", "attach-session", "-t", name])
+        os.execvp("tmux", ["tmux", "attach-session", "-t", target])
 
 
 def create_and_enter_tmux(project_dir, claude_args, claude_sid=None):
@@ -163,10 +182,11 @@ def create_and_enter_tmux(project_dir, claude_args, claude_sid=None):
         check=True,
     )
 
+    target = f"={name}"
     if claude_sid:
-        tmux("set-environment", "-t", name, "CL_SID", claude_sid)
-    tmux("set-environment", "-t", name, "CL_PROJECT", project_dir)
-    tmux("set-hook", "-t", name, "client-attached", "set destroy-unattached on")
+        tmux("set-environment", "-t", target, "CL_SID", claude_sid)
+    tmux("set-environment", "-t", target, "CL_PROJECT", project_dir)
+    tmux("set-hook", "-t", target, "client-attached", "set destroy-unattached on")
 
     enter_tmux(name)
 
@@ -227,14 +247,20 @@ def get_session_tail(session_file):
     except OSError:
         return "", True
 
-    # Read the tail — last 32KB covers the most recent messages
+    if size == 0:
+        return "", True
+
+    # Read the tail — last 32KB covers the most recent messages.
+    # Use binary mode for seek (byte offsets from stat() are unreliable in
+    # text mode with multi-byte UTF-8), then decode.
     tail_bytes = min(size, 32 * 1024)
     try:
-        with open(session_file) as f:
+        with open(session_file, "rb") as f:
             if tail_bytes < size:
                 f.seek(size - tail_bytes)
                 f.readline()  # skip partial first line
-            lines = f.readlines()
+            raw = f.read()
+        lines = raw.decode("utf-8", errors="replace").splitlines(True)
     except OSError:
         return "", True
 
@@ -352,8 +378,12 @@ def get_history_sessions():
 
 
 def relative_time(ts_ms):
+    if ts_ms <= 0:
+        return "?"
     now = datetime.now(timezone.utc).timestamp() * 1000
     diff_s = (now - ts_ms) / 1000
+    if diff_s < 0:
+        return "now"
     if diff_s < 60:
         return "now"
     if diff_s < 3600:
@@ -523,7 +553,7 @@ def run_fzf(lines):
                 "--header", " Sessions  [tab: settings]",
                 "--delimiter", "\t", "--with-nth", "2..",
                 "--height", "~50%", "--reverse",
-                "--bind", f"load:reload({reload_cmd})",
+                "--bind", f"load:reload-sync({reload_cmd})",
                 "--bind", f"tab:become({settings_cmd})",
             ],
             input="\n".join(lines),
@@ -623,6 +653,7 @@ def main():
     # Pass-through: args go straight to claude
     if len(sys.argv) > 1:
         start_session(os.getcwd(), sys.argv[1:])
+        return  # start_session normally never returns (execvp), but guard against it
 
     history = get_history_sessions()
     live = get_live_sessions()
@@ -630,6 +661,7 @@ def main():
     # Nothing to pick from — just launch
     if not history and not live:
         start_session(os.getcwd(), [])
+        return
 
     cwd = os.getcwd()
     key = run_fzf(build_picker_lines(live, history, cwd))
