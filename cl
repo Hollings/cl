@@ -578,7 +578,14 @@ def run_settings_fzf():
             if not SETTINGS_FILE.exists():
                 save_settings(load_settings())
             editor = os.environ.get("EDITOR", "vi" if not IS_WINDOWS else "notepad")
-            subprocess.call([editor, str(SETTINGS_FILE)])
+            # Open editor with explicit TTY — stdin/stdout may be pipes
+            # from the fzf subprocess wiring, so we connect directly to /dev/tty
+            if IS_WINDOWS:
+                subprocess.call([editor, str(SETTINGS_FILE)])
+            else:
+                tty = open("/dev/tty", "r+")
+                subprocess.call([editor, str(SETTINGS_FILE)], stdin=tty, stdout=tty, stderr=tty)
+                tty.close()
             # Loop back to show updated settings
 
         else:
