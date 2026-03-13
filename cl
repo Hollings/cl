@@ -108,12 +108,13 @@ def tmux_session_exists(name):
 def tmux_env_all(session_name):
     """Read all tmux environment variables for a session as a dict."""
     result = tmux("show-environment", "-t", f"={session_name}")
+    if result.returncode != 0:
+        return {}
     env = {}
-    if result.returncode == 0:
-        for line in result.stdout.strip().split("\n"):
-            if "=" in line:
-                k, v = line.split("=", 1)
-                env[k] = v
+    for line in result.stdout.strip().split("\n"):
+        if "=" in line:
+            k, v = line.split("=", 1)
+            env[k] = v
     return env
 
 
@@ -121,18 +122,15 @@ def get_live_sessions():
     """Return dict of active cl/ tmux sessions: name -> info."""
     if not use_tmux():
         return {}
-
     result = tmux("list-sessions", "-F", "#{session_name}\t#{session_attached}")
     if result.returncode != 0:
         return {}
-
     sessions = {}
     for line in result.stdout.strip().split("\n"):
         if not line or not line.startswith(TMUX_PREFIX):
             continue
         parts = line.split("\t")
         name = parts[0]
-        # Single subprocess per session instead of two separate tmux_env calls
         env = tmux_env_all(name)
         sessions[name] = {
             "attached": len(parts) > 1 and parts[1] == "1",
@@ -147,7 +145,6 @@ def make_tmux_name(project_path):
     basename = Path(project_path).name or "home"
     basename = basename.replace(".", "_").replace(":", "_")
     name = f"{TMUX_PREFIX}{basename}"
-
     if not tmux_session_exists(name):
         return name
     for i in range(2, 100):
@@ -160,10 +157,8 @@ def make_tmux_name(project_path):
 def enter_tmux(name):
     """Attach to or switch to a tmux session (never returns)."""
     target = f"={name}"  # exact match — tmux does prefix matching without '='
-    if os.environ.get("TMUX"):
-        os.execvp("tmux", ["tmux", "switch-client", "-t", target])
-    else:
-        os.execvp("tmux", ["tmux", "attach-session", "-t", target])
+    cmd = "switch-client" if os.environ.get("TMUX") else "attach-session"
+    os.execvp("tmux", ["tmux", cmd, "-t", target])
 
 
 def create_and_enter_tmux(project_dir, claude_args, claude_sid=None):
@@ -176,18 +171,15 @@ def create_and_enter_tmux(project_dir, claude_args, claude_sid=None):
     """
     name = make_tmux_name(project_dir)
     cmd_str = " ".join(shlex.quote(a) for a in [CLAUDE_BIN] + get_base_flags() + list(claude_args))
-
     subprocess.run(
         ["tmux", "new-session", "-d", "-s", name, "-c", project_dir, cmd_str],
         check=True,
     )
-
     target = f"={name}"
     if claude_sid:
         tmux("set-environment", "-t", target, "CL_SID", claude_sid)
     tmux("set-environment", "-t", target, "CL_PROJECT", project_dir)
     tmux("set-hook", "-t", target, "client-attached", "set destroy-unattached on")
-
     enter_tmux(name)
 
 
@@ -196,9 +188,7 @@ def create_and_enter_tmux(project_dir, claude_args, claude_sid=None):
 
 def encode_project_path(path):
     """Encode a path the way Claude Code names project directories."""
-    # Normalize Windows backslashes
-    path = path.replace("\\", "/")
-    return path.replace("/", "-").replace(" ", "-").replace("~", "-")
+    return path.replace("\\", "/").replace("/", "-").replace(" ", "-").replace("~", "-")
 
 
 def extract_message_text(entry):
@@ -208,16 +198,13 @@ def extract_message_text(entry):
         return content
     if isinstance(content, list):
         for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                text = part.get("text", "")
-                if text:
-                    return text
+            if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
+                return part["text"]
     return ""
 
 
-def parse_session_file(path):
-    """Extract cwd and first user message from a session JSONL file."""
-    cwd = first_msg = None
+def parse_session_cwd(path):
+    """Extract the cwd from a session JSONL file."""
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -227,13 +214,9 @@ def parse_session_file(path):
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if not cwd and "cwd" in entry:
-                cwd = entry["cwd"]
-            if not first_msg and entry.get("type") == "user":
-                first_msg = extract_message_text(entry)
-            if cwd and first_msg:
-                break
-    return cwd, first_msg
+            if "cwd" in entry:
+                return entry["cwd"]
+    return None
 
 
 def get_session_tail(session_file):
@@ -246,7 +229,6 @@ def get_session_tail(session_file):
         size = session_file.stat().st_size
     except OSError:
         return "", True
-
     if size == 0:
         return "", True
 
@@ -274,18 +256,13 @@ def get_session_tail(session_file):
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        t = entry.get("type", "")
-        sub = entry.get("subtype", "")
+        t, sub = entry.get("type", ""), entry.get("subtype", "")
         # These mark the end of a completed turn
         if t == "system" and sub in ("stop_hook_summary", "turn_duration"):
-            is_waiting = True
             break
         if t == "user":
-            # Last entry is user — claude hasn't responded yet
-            is_waiting = True
             break
         if t in ("assistant", "progress"):
-            # Claude is mid-turn
             is_waiting = False
             break
         # Skip metadata entries (file-history-snapshot, last-prompt, etc.)
@@ -327,11 +304,9 @@ def get_history_sessions():
                 sid = entry.get("sessionId")
                 if not sid:
                     continue
-                project = entry.get("project", "")
                 ts = entry.get("timestamp", 0)
-                display = entry.get("display", "")
                 if sid not in sessions:
-                    sessions[sid] = {"project": project, "first_msg": display, "last_ts": ts}
+                    sessions[sid] = {"project": entry.get("project", ""), "last_ts": ts}
                 elif ts > sessions[sid]["last_ts"]:
                     sessions[sid]["last_ts"] = ts
 
@@ -345,11 +320,10 @@ def get_history_sessions():
                 if sid in sessions:
                     continue
                 try:
-                    cwd, first_msg = parse_session_file(session_file)
+                    cwd = parse_session_cwd(session_file)
                     if cwd:
                         sessions[sid] = {
                             "project": cwd,
-                            "first_msg": first_msg or "",
                             "last_ts": session_file.stat().st_mtime * 1000,
                         }
                 except (OSError, json.JSONDecodeError):
@@ -365,7 +339,6 @@ def get_history_sessions():
         result.append({
             "id": sid,
             "project": info["project"],
-            "first_msg": info["first_msg"],
             "last_ts": info["last_ts"],
             "file": session_file,
         })
@@ -380,10 +353,7 @@ def get_history_sessions():
 def relative_time(ts_ms):
     if ts_ms <= 0:
         return "?"
-    now = datetime.now(timezone.utc).timestamp() * 1000
-    diff_s = (now - ts_ms) / 1000
-    if diff_s < 0:
-        return "now"
+    diff_s = (datetime.now(timezone.utc).timestamp() * 1000 - ts_ms) / 1000
     if diff_s < 60:
         return "now"
     if diff_s < 3600:
@@ -391,19 +361,15 @@ def relative_time(ts_ms):
     if diff_s < 86400:
         return f"{int(diff_s / 3600)}h"
     days = diff_s / 86400
-    if days < 30:
-        return f"{int(days)}d"
-    return f"{int(days / 30)}mo"
+    return f"{int(days / 30)}mo" if days >= 30 else f"{int(days)}d"
 
 
 def short_path(path):
     home = str(Path.home())
     if path.startswith(home):
         return "~" + path[len(home):]
-    # Windows: also try with normalized separators
     if IS_WINDOWS:
-        norm_path = path.replace("/", "\\")
-        norm_home = home.replace("/", "\\")
+        norm_path, norm_home = path.replace("/", "\\"), home.replace("/", "\\")
         if norm_path.startswith(norm_home):
             return "~" + norm_path[len(norm_home):]
     return path
@@ -427,94 +393,67 @@ def separator(label):
     return f"SEP\t\x1b[2m  --- {label} ---\x1b[0m"
 
 
+def _render_live_block(live_dict, history, lines):
+    """Render live tmux sessions into lines (shared by local/other sections)."""
+    for tname, info in live_dict.items():
+        attached = info["attached"]
+        status = "\x1b[32m●\x1b[0m" if attached else "\x1b[33m○\x1b[0m"
+        label = "attached" if attached else "detached"
+        proj = short_path(info["project"]) if info["project"] else tname
+        msg = ""
+        if info["claude_sid"]:
+            match = next((h for h in history if h["id"] == info["claude_sid"]), None)
+            if match:
+                msg = truncate(get_session_tail(match["file"])[0])
+        lines.append(
+            f"TMUX:{tname}\t{status} \x1b[2m{label:>8}\x1b[0m  \x1b[36m{proj}\x1b[0m  {msg}"
+        )
+
+
+def _render_history_block(sessions, lines):
+    """Render history sessions into lines (shared by local/other sections)."""
+    for s in sessions:
+        last_msg, is_waiting = get_session_tail(s["file"])
+        state = "\x1b[32m●\x1b[0m" if is_waiting else "\x1b[33m⟳\x1b[0m"
+        lines.append(format_session_line(
+            s["id"], state, relative_time(s["last_ts"]),
+            short_path(s["project"]), last_msg,
+        ))
+
+
 def build_picker_lines(live, history, cwd):
     """Build the fzf input lines, grouped by context."""
     live_sids = {v["claude_sid"] for v in live.values() if v["claude_sid"]}
     cwd_short = short_path(cwd)
 
-    # Split history into: sessions in current dir vs elsewhere
-    local_sessions = []
-    other_sessions = []
+    def is_local(project):
+        return project == cwd or short_path(project) == cwd_short
+
+    # Split history into current dir vs elsewhere, skip live sessions
+    local_sessions, other_sessions = [], []
     for s in history[:50]:
-        if s["id"] in live_sids:
-            continue
-        if s["project"] == cwd or short_path(s["project"]) == cwd_short:
-            local_sessions.append(s)
-        else:
-            other_sessions.append(s)
+        if s["id"] not in live_sids:
+            (local_sessions if is_local(s["project"]) else other_sessions).append(s)
 
     # Split live tmux sessions the same way
-    local_live = {}
-    other_live = {}
+    local_live, other_live = {}, {}
     for tname, info in live.items():
-        proj = info.get("project", "")
-        if proj == cwd or short_path(proj) == cwd_short:
-            local_live[tname] = info
-        else:
-            other_live[tname] = info
+        target = local_live if is_local(info.get("project", "")) else other_live
+        target[tname] = info
 
-    lines = []
-
-    # --- New session ---
-    lines.append(f"NEW\t\x1b[32m   +\x1b[0m  {cwd_short}  \x1b[2mnew session\x1b[0m")
+    lines = [f"NEW\t\x1b[32m   +\x1b[0m  {cwd_short}  \x1b[2mnew session\x1b[0m"]
 
     # --- Sessions in current directory ---
-    has_local = local_live or local_sessions
-    if has_local:
+    if local_live or local_sessions:
         lines.append(separator(cwd_short))
-
-    for tname, info in local_live.items():
-        if info["attached"]:
-            status, label = "\x1b[32m●\x1b[0m", "attached"
-        else:
-            status, label = "\x1b[33m○\x1b[0m", "detached"
-        proj = short_path(info["project"]) if info["project"] else tname
-        msg = ""
-        if info["claude_sid"]:
-            match = next((h for h in history if h["id"] == info["claude_sid"]), None)
-            if match:
-                msg_text, _ = get_session_tail(match["file"])
-                msg = truncate(msg_text)
-        lines.append(
-            f"TMUX:{tname}\t{status} \x1b[2m{label:>8}\x1b[0m  \x1b[36m{proj}\x1b[0m  {msg}"
-        )
-
-    for s in local_sessions:
-        last_msg, is_waiting = get_session_tail(s["file"])
-        state = "\x1b[32m●\x1b[0m" if is_waiting else "\x1b[33m⟳\x1b[0m"
-        lines.append(format_session_line(
-            s["id"], state, relative_time(s["last_ts"]),
-            short_path(s["project"]), last_msg,
-        ))
+    _render_live_block(local_live, history, lines)
+    _render_history_block(local_sessions, lines)
 
     # --- All other sessions ---
-    has_other = other_live or other_sessions
-    if has_other:
+    if other_live or other_sessions:
         lines.append(separator("other sessions"))
-
-    for tname, info in other_live.items():
-        if info["attached"]:
-            status, label = "\x1b[32m●\x1b[0m", "attached"
-        else:
-            status, label = "\x1b[33m○\x1b[0m", "detached"
-        proj = short_path(info["project"]) if info["project"] else tname
-        msg = ""
-        if info["claude_sid"]:
-            match = next((h for h in history if h["id"] == info["claude_sid"]), None)
-            if match:
-                msg_text, _ = get_session_tail(match["file"])
-                msg = truncate(msg_text)
-        lines.append(
-            f"TMUX:{tname}\t{status} \x1b[2m{label:>8}\x1b[0m  \x1b[36m{proj}\x1b[0m  {msg}"
-        )
-
-    for s in other_sessions:
-        last_msg, is_waiting = get_session_tail(s["file"])
-        state = "\x1b[32m●\x1b[0m" if is_waiting else "\x1b[33m⟳\x1b[0m"
-        lines.append(format_session_line(
-            s["id"], state, relative_time(s["last_ts"]),
-            short_path(s["project"]), last_msg,
-        ))
+    _render_live_block(other_live, history, lines)
+    _render_history_block(other_sessions, lines)
 
     return lines
 
@@ -523,17 +462,14 @@ def build_settings_lines():
     """Build fzf lines for the settings panel."""
     settings = load_settings()
     lines = []
-    for key, (label, desc, _default) in SETTING_DEFS.items():
-        val = settings.get(key, _default)
-        # Grey out tmux option if tmux isn't installed
+    for key, (label, desc, default) in SETTING_DEFS.items():
+        val = settings.get(key, default)
         if key == "use_tmux" and not TMUX_AVAILABLE:
             indicator = "\x1b[2m---\x1b[0m"
             note = f"\x1b[2m{label}  (tmux not installed)\x1b[0m"
-        elif val:
-            indicator = "\x1b[32m ON\x1b[0m"
-            note = f"{label}  \x1b[2m{desc}\x1b[0m"
         else:
-            indicator = "\x1b[31mOFF\x1b[0m"
+            on = val
+            indicator = "\x1b[32m ON\x1b[0m" if on else "\x1b[31mOFF\x1b[0m"
             note = f"{label}  \x1b[2m{desc}\x1b[0m"
         lines.append(f"SET:{key}\t  [{indicator}]  {note}")
     return lines
@@ -579,11 +515,7 @@ def run_settings_fzf():
     """Show fzf settings panel. Returns to session picker on Tab."""
     script = shlex.quote(os.path.abspath(sys.argv[0]))
     python = shlex.quote(sys.executable)
-    sessions_cmd = f"{python} {script}"
-    toggle_cmd = f"{python} {script} --toggle {{1}}"
-    reload_cmd = f"{python} {script} --settings-lines"
 
-    lines = build_settings_lines()
     try:
         subprocess.run(
             [
@@ -591,10 +523,10 @@ def run_settings_fzf():
                 "--header", " Settings  [tab: sessions]  [enter: toggle]",
                 "--delimiter", "\t", "--with-nth", "2..",
                 "--height", "~50%", "--reverse",
-                "--bind", f"tab:become({sessions_cmd})",
-                "--bind", f"enter:execute-silent({toggle_cmd})+reload({reload_cmd})",
+                "--bind", f"tab:become({python} {script})",
+                "--bind", f"enter:execute-silent({python} {script} --toggle {{1}})+reload({python} {script} --settings-lines)",
             ],
-            input="\n".join(lines),
+            input="\n".join(build_settings_lines()),
             text=True,
         )
     except FileNotFoundError:
@@ -613,46 +545,41 @@ def start_session(project_dir, claude_args, claude_sid=None):
 
 
 def main():
+    args = sys.argv
+
     # Internal: print picker lines to stdout (used by fzf reload)
-    if "--picker-lines" in sys.argv:
-        if "--delay" in sys.argv:
+    if "--picker-lines" in args:
+        if "--delay" in args:
             import time
             time.sleep(2)
-        history = get_history_sessions()
-        live = get_live_sessions()
         cwd = os.getcwd()
-        print("\n".join(build_picker_lines(live, history, cwd)))
+        print("\n".join(build_picker_lines(get_live_sessions(), get_history_sessions(), cwd)))
         return
 
     # Internal: print settings lines to stdout (used by fzf reload)
-    if "--settings-lines" in sys.argv:
+    if "--settings-lines" in args:
         print("\n".join(build_settings_lines()))
         return
 
     # Internal: toggle a setting
-    if "--toggle" in sys.argv:
-        idx = sys.argv.index("--toggle")
-        if idx + 1 < len(sys.argv):
-            raw_key = sys.argv[idx + 1]
-            # fzf passes "SET:key", strip the prefix
-            key = raw_key.removeprefix("SET:")
-            if key in SETTING_DEFS:
-                # Don't allow toggling tmux if it's not installed
-                if key == "use_tmux" and not TMUX_AVAILABLE:
-                    return
+    if "--toggle" in args:
+        idx = args.index("--toggle")
+        if idx + 1 < len(args):
+            key = args[idx + 1].removeprefix("SET:")
+            if key in SETTING_DEFS and not (key == "use_tmux" and not TMUX_AVAILABLE):
                 settings = load_settings()
                 settings[key] = not settings.get(key, SETTING_DEFS[key][2])
                 save_settings(settings)
         return
 
     # Settings panel
-    if "--settings" in sys.argv:
+    if "--settings" in args:
         run_settings_fzf()
         return
 
     # Pass-through: args go straight to claude
-    if len(sys.argv) > 1:
-        start_session(os.getcwd(), sys.argv[1:])
+    if len(args) > 1:
+        start_session(os.getcwd(), args[1:])
         return  # start_session normally never returns (execvp), but guard against it
 
     history = get_history_sessions()
