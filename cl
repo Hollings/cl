@@ -577,6 +577,17 @@ def main():
         run_settings_fzf()
         return
 
+    # Self-update via git pull
+    if "--update" in args:
+        repo_dir = Path(__file__).resolve().parent
+        if not (repo_dir / ".git").exists():
+            print("Not a git install — update manually.")
+            sys.exit(1)
+        result = subprocess.run(
+            ["git", "-C", str(repo_dir), "pull", "--ff-only"],
+        )
+        sys.exit(result.returncode)
+
     # Pass-through: args go straight to claude
     if len(args) > 1:
         start_session(os.getcwd(), args[1:])
