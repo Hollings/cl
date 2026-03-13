@@ -535,9 +535,9 @@ def run_settings_fzf():
     """Show fzf settings panel. Returns to session picker on Tab."""
     script = shlex.quote(os.path.abspath(sys.argv[0]))
     python = shlex.quote(sys.executable)
-    reload_cmd = f"{python} {script} --settings-lines"
-    # Toggle handles SET: keys, edit-flags handles EDIT: keys. Both reload after.
-    action_cmd = f"{python} {script} --settings-action {{1}}"
+    # become() replaces fzf, giving the editor (or toggle) full TTY access,
+    # then re-launches the settings panel after the action completes.
+    action_cmd = f"{python} {script} --settings-action {{1}} && {python} {script} --settings"
 
     try:
         subprocess.run(
@@ -547,7 +547,7 @@ def run_settings_fzf():
                 "--delimiter", "\t", "--with-nth", "2..",
                 "--height", "~50%", "--reverse",
                 "--bind", f"tab:become({python} {script})",
-                "--bind", f"enter:execute({action_cmd})+reload({reload_cmd})",
+                "--bind", f"enter:become({action_cmd})",
             ],
             input="\n".join(build_settings_lines()),
             text=True,
