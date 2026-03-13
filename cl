@@ -532,28 +532,62 @@ def run_fzf(lines):
 
 
 def run_settings_fzf():
-    """Show fzf settings panel. Returns to session picker on Tab."""
+    """Show fzf settings panel in a loop. Handles toggles and editor directly."""
     script = shlex.quote(os.path.abspath(sys.argv[0]))
     python = shlex.quote(sys.executable)
-    # become() replaces fzf, giving the editor (or toggle) full TTY access,
-    # then re-launches the settings panel after the action completes.
-    action_cmd = f"{python} {script} --settings-action {{1}} && {python} {script} --settings"
 
-    try:
-        subprocess.run(
-            [
-                "fzf", "--ansi", "--no-sort",
-                "--header", " Settings  [tab: sessions]  [enter: toggle/edit]",
-                "--delimiter", "\t", "--with-nth", "2..",
-                "--height", "~50%", "--reverse",
-                "--bind", f"tab:become({python} {script})",
-                "--bind", f"enter:become({action_cmd})",
-            ],
-            input="\n".join(build_settings_lines()),
-            text=True,
-        )
-    except FileNotFoundError:
-        pass
+    while True:
+        _settings_cache_reset()
+        try:
+            result = subprocess.run(
+                [
+                    "fzf", "--ansi", "--no-sort",
+                    "--header", " Settings  [tab: sessions]  [enter: toggle/edit]",
+                    "--delimiter", "\t", "--with-nth", "2..",
+                    "--height", "~50%", "--reverse",
+                    "--expect", "tab",
+                ],
+                input="\n".join(build_settings_lines()),
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError:
+            return
+
+        if result.returncode != 0:
+            return
+
+        lines = result.stdout.strip().split("\n")
+        pressed = lines[0] if lines else ""
+        selected = lines[1].split("\t")[0] if len(lines) > 1 else ""
+
+        if pressed == "tab":
+            # Switch back to sessions picker
+            os.execvp(sys.executable, [sys.executable, os.path.abspath(sys.argv[0])])
+
+        if selected.startswith("SET:"):
+            key = selected.removeprefix("SET:")
+            if key in TOGGLE_DEFS and not (key == "use_tmux" and not TMUX_AVAILABLE):
+                settings = load_settings()
+                settings[key] = not settings.get(key, TOGGLE_DEFS[key][2])
+                save_settings(settings)
+            # Loop back to show updated settings
+
+        elif selected.startswith("EDIT:"):
+            SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            if not SETTINGS_FILE.exists():
+                save_settings(load_settings())
+            editor = os.environ.get("EDITOR", "vi" if not IS_WINDOWS else "notepad")
+            subprocess.call([editor, str(SETTINGS_FILE)])
+            # Loop back to show updated settings
+
+        else:
+            return
+
+
+def _settings_cache_reset():
+    global _settings_cache
+    _settings_cache = None
 
 
 # --- main ---
@@ -582,27 +616,6 @@ def main():
     # Internal: print settings lines to stdout (used by fzf reload)
     if "--settings-lines" in args:
         print("\n".join(build_settings_lines()))
-        return
-
-    # Internal: handle a settings action (toggle or edit)
-    if "--settings-action" in args:
-        idx = args.index("--settings-action")
-        if idx + 1 < len(args):
-            raw = args[idx + 1]
-            if raw.startswith("SET:"):
-                # Toggle a boolean setting
-                key = raw.removeprefix("SET:")
-                if key in TOGGLE_DEFS and not (key == "use_tmux" and not TMUX_AVAILABLE):
-                    settings = load_settings()
-                    settings[key] = not settings.get(key, TOGGLE_DEFS[key][2])
-                    save_settings(settings)
-            elif raw.startswith("EDIT:"):
-                # Open settings file in editor
-                SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-                if not SETTINGS_FILE.exists():
-                    save_settings(load_settings())
-                editor = os.environ.get("EDITOR", "vi" if not IS_WINDOWS else "notepad")
-                subprocess.call([editor, str(SETTINGS_FILE)])
         return
 
     # Settings panel
