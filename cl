@@ -9,11 +9,21 @@ SSH. Sessions auto-destroy when all terminals disconnect.
 Without tmux, sessions launch directly (still get the picker).
 """
 
-import json
 import os
+import sys
+
+# Windows console defaults to cp1252 which can't handle unicode symbols
+# used in the picker (e.g. ⟳, ●). Force UTF-8 early before any output.
+if sys.platform == "win32":
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+import json
 import shlex
 import subprocess
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from shutil import which
@@ -205,7 +215,7 @@ def extract_message_text(entry):
 
 def parse_session_cwd(path):
     """Extract the cwd from a session JSONL file."""
-    with open(path) as f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -292,7 +302,7 @@ def get_history_sessions():
 
     # Primary: history.jsonl has real project paths and session IDs
     if HISTORY_FILE.exists():
-        with open(HISTORY_FILE) as f:
+        with open(HISTORY_FILE, encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:

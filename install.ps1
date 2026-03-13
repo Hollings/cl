@@ -11,10 +11,15 @@ if (-not (Test-Path $InstallDir)) {
 }
 
 # Create a wrapper batch file so 'cl' works from cmd/powershell
+# Detect the right Python command — Windows typically has 'python', not 'python3'
+$PythonCmd = if (Get-Command python3 -ErrorAction SilentlyContinue) { "python3" }
+             elseif (Get-Command python -ErrorAction SilentlyContinue) { "python" }
+             else { "python3" }
+
 $Wrapper = Join-Path $InstallDir "cl.cmd"
 @"
 @echo off
-python3 "%~dp0\..\..\.local\bin\cl.py" %*
+$PythonCmd "%~dp0cl.py" %*
 "@ | Set-Content $Wrapper
 
 # Copy the actual script
