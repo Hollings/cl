@@ -143,6 +143,20 @@ def encode_project_path(path):
     return path.replace("/", "-").replace(" ", "-").replace("~", "-")
 
 
+def extract_message_text(entry):
+    """Pull plain text from a user or assistant message entry."""
+    content = entry.get("message", {}).get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text", "")
+                if text:
+                    return text
+    return ""
+
+
 def parse_session_file(path):
     """Extract cwd and first user message from a session JSONL file."""
     cwd = first_msg = None
@@ -158,17 +172,77 @@ def parse_session_file(path):
             if not cwd and "cwd" in entry:
                 cwd = entry["cwd"]
             if not first_msg and entry.get("type") == "user":
-                content = entry.get("message", {}).get("content", "")
-                if isinstance(content, str):
-                    first_msg = content
-                elif isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            first_msg = part.get("text", "")
-                            break
+                first_msg = extract_message_text(entry)
             if cwd and first_msg:
                 break
     return cwd, first_msg
+
+
+def get_session_tail(session_file):
+    """Read the tail of a session file and return (last_message, is_waiting).
+
+    is_waiting is True if claude has finished its turn and is waiting for
+    user input (safe to resume without desync).
+    """
+    try:
+        size = session_file.stat().st_size
+    except OSError:
+        return "", True
+
+    # Read the tail — last 32KB covers the most recent messages
+    tail_bytes = min(size, 32 * 1024)
+    try:
+        with open(session_file) as f:
+            if tail_bytes < size:
+                f.seek(size - tail_bytes)
+                f.readline()  # skip partial first line
+            lines = f.readlines()
+    except OSError:
+        return "", True
+
+    # Determine state: walk backwards to find the last turn-ending marker
+    is_waiting = True
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        t = entry.get("type", "")
+        sub = entry.get("subtype", "")
+        # These mark the end of a completed turn
+        if t == "system" and sub in ("stop_hook_summary", "turn_duration"):
+            is_waiting = True
+            break
+        if t == "user":
+            # Last entry is user — claude hasn't responded yet
+            is_waiting = True
+            break
+        if t in ("assistant", "progress"):
+            # Claude is mid-turn
+            is_waiting = False
+            break
+        # Skip metadata entries (file-history-snapshot, last-prompt, etc.)
+
+    # Find the last message with text
+    last_msg = ""
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("type") in ("user", "assistant"):
+            text = extract_message_text(entry)
+            if text:
+                last_msg = text
+                break
+
+    return last_msg, is_waiting
 
 
 def get_history_sessions():
@@ -217,17 +291,19 @@ def get_history_sessions():
                 except (OSError, json.JSONDecodeError):
                     continue
 
-    # Keep only sessions whose files still exist on disk
+    # Keep only sessions whose files still exist on disk, resolve file paths
     result = []
     for sid, info in sessions.items():
         encoded = encode_project_path(info["project"])
-        if not (PROJECTS_DIR / encoded / f"{sid}.jsonl").exists():
+        session_file = PROJECTS_DIR / encoded / f"{sid}.jsonl"
+        if not session_file.exists():
             continue
         result.append({
             "id": sid,
             "project": info["project"],
             "first_msg": info["first_msg"],
             "last_ts": info["last_ts"],
+            "file": session_file,
         })
 
     result.sort(key=lambda x: x["last_ts"], reverse=True)
@@ -290,7 +366,8 @@ def build_picker_lines(live, history, cwd):
         if info["claude_sid"]:
             match = next((h for h in history if h["id"] == info["claude_sid"]), None)
             if match:
-                msg = truncate(match["first_msg"])
+                msg_text, _ = get_session_tail(match["file"])
+                msg = truncate(msg_text)
 
         lines.append(
             f"TMUX:{tname}\t{status} \x1b[2m{label:>8}\x1b[0m  \x1b[36m{proj}\x1b[0m  {msg}"
@@ -300,9 +377,11 @@ def build_picker_lines(live, history, cwd):
     for s in history[:50]:
         if s["id"] in live_sids:
             continue
+        last_msg, is_waiting = get_session_tail(s["file"])
+        state = "\x1b[32m●\x1b[0m" if is_waiting else "\x1b[33m⟳\x1b[0m"
         lines.append(
-            f"{s['id']}\t  \x1b[33m{relative_time(s['last_ts']):>8}\x1b[0m"
-            f"  \x1b[36m{short_path(s['project'])}\x1b[0m  {truncate(s['first_msg'])}"
+            f"{s['id']}\t{state} \x1b[33m{relative_time(s['last_ts']):>4}\x1b[0m"
+            f"  \x1b[36m{short_path(s['project'])}\x1b[0m  {truncate(last_msg)}"
         )
 
     return lines
