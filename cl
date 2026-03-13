@@ -384,21 +384,60 @@ def truncate(text, length=50):
     return text[:length - 3] + "..." if len(text) > length else text
 
 
+def format_session_line(key, state, time_str, proj, msg):
+    """Format a single session line for fzf."""
+    return (
+        f"{key}\t{state} \x1b[33m{time_str:>4}\x1b[0m"
+        f"  \x1b[36m{proj}\x1b[0m  {truncate(msg)}"
+    )
+
+
+def separator(label):
+    """A dim, non-selectable separator line."""
+    return f"SEP\t\x1b[2m  --- {label} ---\x1b[0m"
+
+
 def build_picker_lines(live, history, cwd):
-    """Build the fzf input lines."""
+    """Build the fzf input lines, grouped by context."""
     live_sids = {v["claude_sid"] for v in live.values() if v["claude_sid"]}
+    cwd_short = short_path(cwd)
+
+    # Split history into: sessions in current dir vs elsewhere
+    local_sessions = []
+    other_sessions = []
+    for s in history[:50]:
+        if s["id"] in live_sids:
+            continue
+        if s["project"] == cwd or short_path(s["project"]) == cwd_short:
+            local_sessions.append(s)
+        else:
+            other_sessions.append(s)
+
+    # Split live tmux sessions the same way
+    local_live = {}
+    other_live = {}
+    for tname, info in live.items():
+        proj = info.get("project", "")
+        if proj == cwd or short_path(proj) == cwd_short:
+            local_live[tname] = info
+        else:
+            other_live[tname] = info
+
     lines = []
 
-    # New session option
-    lines.append(f"NEW\t\x1b[32m   +\x1b[0m  {short_path(cwd)}  \x1b[2mnew session\x1b[0m")
+    # --- New session ---
+    lines.append(f"NEW\t\x1b[32m   +\x1b[0m  {cwd_short}  \x1b[2mnew session\x1b[0m")
 
-    # Active tmux sessions
-    for tname, info in live.items():
+    # --- Sessions in current directory ---
+    has_local = local_live or local_sessions
+    if has_local:
+        lines.append(separator(cwd_short))
+
+    for tname, info in local_live.items():
         if info["attached"]:
             status, label = "\x1b[32m●\x1b[0m", "attached"
         else:
             status, label = "\x1b[33m○\x1b[0m", "detached"
-
         proj = short_path(info["project"]) if info["project"] else tname
         msg = ""
         if info["claude_sid"]:
@@ -406,21 +445,46 @@ def build_picker_lines(live, history, cwd):
             if match:
                 msg_text, _ = get_session_tail(match["file"])
                 msg = truncate(msg_text)
-
         lines.append(
             f"TMUX:{tname}\t{status} \x1b[2m{label:>8}\x1b[0m  \x1b[36m{proj}\x1b[0m  {msg}"
         )
 
-    # Historical sessions not currently in tmux
-    for s in history[:50]:
-        if s["id"] in live_sids:
-            continue
+    for s in local_sessions:
         last_msg, is_waiting = get_session_tail(s["file"])
         state = "\x1b[32m●\x1b[0m" if is_waiting else "\x1b[33m⟳\x1b[0m"
+        lines.append(format_session_line(
+            s["id"], state, relative_time(s["last_ts"]),
+            short_path(s["project"]), last_msg,
+        ))
+
+    # --- All other sessions ---
+    has_other = other_live or other_sessions
+    if has_other:
+        lines.append(separator("other sessions"))
+
+    for tname, info in other_live.items():
+        if info["attached"]:
+            status, label = "\x1b[32m●\x1b[0m", "attached"
+        else:
+            status, label = "\x1b[33m○\x1b[0m", "detached"
+        proj = short_path(info["project"]) if info["project"] else tname
+        msg = ""
+        if info["claude_sid"]:
+            match = next((h for h in history if h["id"] == info["claude_sid"]), None)
+            if match:
+                msg_text, _ = get_session_tail(match["file"])
+                msg = truncate(msg_text)
         lines.append(
-            f"{s['id']}\t{state} \x1b[33m{relative_time(s['last_ts']):>4}\x1b[0m"
-            f"  \x1b[36m{short_path(s['project'])}\x1b[0m  {truncate(last_msg)}"
+            f"TMUX:{tname}\t{status} \x1b[2m{label:>8}\x1b[0m  \x1b[36m{proj}\x1b[0m  {msg}"
         )
+
+    for s in other_sessions:
+        last_msg, is_waiting = get_session_tail(s["file"])
+        state = "\x1b[32m●\x1b[0m" if is_waiting else "\x1b[33m⟳\x1b[0m"
+        lines.append(format_session_line(
+            s["id"], state, relative_time(s["last_ts"]),
+            short_path(s["project"]), last_msg,
+        ))
 
     return lines
 
@@ -570,7 +634,7 @@ def main():
     cwd = os.getcwd()
     key = run_fzf(build_picker_lines(live, history, cwd))
 
-    if key is None:
+    if key is None or key == "SEP":
         sys.exit(0)
     elif key == "NEW":
         start_session(cwd, [])
