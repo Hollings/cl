@@ -38,11 +38,12 @@ CLAUDE_BIN = "claude"
 TMUX_PREFIX = "cl/"
 TMUX_AVAILABLE = not IS_WINDOWS and which("tmux") is not None
 
-# Setting definitions: key -> (label, description, default)
-SETTING_DEFS = {
+# Toggle settings: key -> (label, description, default)
+TOGGLE_DEFS = {
     "use_tmux": ("tmux wrapping", "Wrap sessions in tmux for SSH attach", True),
-    "skip_permissions": ("skip permissions", "--dangerously-skip-permissions flag", True),
 }
+
+DEFAULT_FLAGS = ["--dangerously-skip-permissions"]
 
 
 # --- settings ---
@@ -56,13 +57,18 @@ def load_settings():
     global _settings_cache
     if _settings_cache is not None:
         return _settings_cache
-    defaults = {k: v[2] for k, v in SETTING_DEFS.items()}
+    defaults = {k: v[2] for k, v in TOGGLE_DEFS.items()}
+    defaults["flags"] = DEFAULT_FLAGS
     if not SETTINGS_FILE.exists():
         _settings_cache = defaults
         return defaults
     try:
         with open(SETTINGS_FILE) as f:
             saved = json.loads(f.read())
+        # Migrate old skip_permissions toggle -> flags list
+        if "skip_permissions" in saved and "flags" not in saved:
+            saved["flags"] = DEFAULT_FLAGS if saved.pop("skip_permissions") else []
+            save_settings({**defaults, **saved})
         _settings_cache = {**defaults, **saved}
     except (json.JSONDecodeError, OSError):
         _settings_cache = defaults
@@ -82,10 +88,7 @@ def use_tmux():
 
 
 def get_base_flags():
-    flags = []
-    if load_settings().get("skip_permissions", True):
-        flags.append("--dangerously-skip-permissions")
-    return flags
+    return list(load_settings().get("flags", DEFAULT_FLAGS))
 
 
 # --- launch (no tmux) ---
@@ -472,16 +475,23 @@ def build_settings_lines():
     """Build fzf lines for the settings panel."""
     settings = load_settings()
     lines = []
-    for key, (label, desc, default) in SETTING_DEFS.items():
+
+    # Toggle settings
+    for key, (label, desc, default) in TOGGLE_DEFS.items():
         val = settings.get(key, default)
         if key == "use_tmux" and not TMUX_AVAILABLE:
             indicator = "\x1b[2m---\x1b[0m"
             note = f"\x1b[2m{label}  (tmux not installed)\x1b[0m"
         else:
-            on = val
-            indicator = "\x1b[32m ON\x1b[0m" if on else "\x1b[31mOFF\x1b[0m"
+            indicator = "\x1b[32m ON\x1b[0m" if val else "\x1b[31mOFF\x1b[0m"
             note = f"{label}  \x1b[2m{desc}\x1b[0m"
         lines.append(f"SET:{key}\t  [{indicator}]  {note}")
+
+    # Flags (freeform)
+    flags = settings.get("flags", DEFAULT_FLAGS)
+    flags_str = " ".join(flags) if flags else "(none)"
+    lines.append(f"EDIT:flags\t  \x1b[33mflags\x1b[0m  {flags_str}  \x1b[2m[enter: edit]\x1b[0m")
+
     return lines
 
 
@@ -525,16 +535,19 @@ def run_settings_fzf():
     """Show fzf settings panel. Returns to session picker on Tab."""
     script = shlex.quote(os.path.abspath(sys.argv[0]))
     python = shlex.quote(sys.executable)
+    reload_cmd = f"{python} {script} --settings-lines"
+    # Toggle handles SET: keys, edit-flags handles EDIT: keys. Both reload after.
+    action_cmd = f"{python} {script} --settings-action {{1}}"
 
     try:
         subprocess.run(
             [
                 "fzf", "--ansi", "--no-sort",
-                "--header", " Settings  [tab: sessions]  [enter: toggle]",
+                "--header", " Settings  [tab: sessions]  [enter: toggle/edit]",
                 "--delimiter", "\t", "--with-nth", "2..",
                 "--height", "~50%", "--reverse",
                 "--bind", f"tab:become({python} {script})",
-                "--bind", f"enter:execute-silent({python} {script} --toggle {{1}})+reload({python} {script} --settings-lines)",
+                "--bind", f"enter:execute({action_cmd})+reload({reload_cmd})",
             ],
             input="\n".join(build_settings_lines()),
             text=True,
@@ -571,15 +584,25 @@ def main():
         print("\n".join(build_settings_lines()))
         return
 
-    # Internal: toggle a setting
-    if "--toggle" in args:
-        idx = args.index("--toggle")
+    # Internal: handle a settings action (toggle or edit)
+    if "--settings-action" in args:
+        idx = args.index("--settings-action")
         if idx + 1 < len(args):
-            key = args[idx + 1].removeprefix("SET:")
-            if key in SETTING_DEFS and not (key == "use_tmux" and not TMUX_AVAILABLE):
-                settings = load_settings()
-                settings[key] = not settings.get(key, SETTING_DEFS[key][2])
-                save_settings(settings)
+            raw = args[idx + 1]
+            if raw.startswith("SET:"):
+                # Toggle a boolean setting
+                key = raw.removeprefix("SET:")
+                if key in TOGGLE_DEFS and not (key == "use_tmux" and not TMUX_AVAILABLE):
+                    settings = load_settings()
+                    settings[key] = not settings.get(key, TOGGLE_DEFS[key][2])
+                    save_settings(settings)
+            elif raw.startswith("EDIT:"):
+                # Open settings file in editor
+                SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+                if not SETTINGS_FILE.exists():
+                    save_settings(load_settings())
+                editor = os.environ.get("EDITOR", "vi" if not IS_WINDOWS else "notepad")
+                subprocess.call([editor, str(SETTINGS_FILE)])
         return
 
     # Settings panel
