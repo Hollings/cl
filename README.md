@@ -5,8 +5,10 @@ Session manager for [Claude Code](https://docs.anthropic.com/en/docs/claude-code
 ```
  Sessions  [tab: settings]
    +  ~/myproject                new session
+  --- ~/myproject ---
  ● 1m  ~/myproject              Done. Here's the updated config...
- ⟳ 3m  ~/api                    Running the test suite now...
+ ⟳ 3m  ~/myproject              Running the test suite now...
+  --- other sessions ---
  ● 2h  ~/frontend               Fixed the auth redirect bug, ...
  ● 5d  ~                        Done. The drive is formatted...
 ```
@@ -42,6 +44,7 @@ This symlinks `cl` into `~/.local/bin` (or copies on Windows) and checks for mis
 ```bash
 cl                    # open the session picker
 cl "fix the auth bug" # start a new session with a prompt (skip picker)
+cl --update           # self-update from GitHub
 ```
 
 ### Picker controls

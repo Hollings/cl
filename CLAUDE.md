@@ -16,6 +16,7 @@ python3 cl --settings-lines     # dump settings output
 python3 cl --toggle SET:use_tmux  # toggle a setting
 python3 cl --settings           # launch settings fzf panel
 python3 cl                      # full picker (requires interactive terminal)
+python3 cl --update             # self-update via git pull
 ```
 
 Syntax check: `python3 -c "import py_compile; py_compile.compile('cl', doraise=True)"`
@@ -27,10 +28,10 @@ Everything lives in `./cl` — a single executable Python script with no interna
 - **Settings** (~line 38): `load_settings()`/`save_settings()` with per-process cache, persisted to `~/.claude/cl-settings.json`
 - **Launch** (~line 81): `launch_claude()` for direct exec, or `create_and_enter_tmux()` for the tmux wrapper path. `start_session()` dispatches between them based on the `use_tmux` setting and platform.
 - **tmux** (~line 94): Session creation with `destroy-unattached` via a `client-attached` hook (can't set it on a detached session or tmux kills it immediately)
-- **Session history** (~line 198): `get_history_sessions()` reads `~/.claude/history.jsonl` for session metadata, falls back to scanning `~/.claude/projects/*/` JSONL files. `get_session_tail()` reads the last 32KB of a session file to extract the latest message and turn state.
-- **Display** (~line 381): Builds fzf input lines grouped into sections (new session, current dir, other). `build_settings_lines()` builds the settings panel.
-- **fzf wiring** (~line 546): `run_fzf()` launches fzf with `load:reload-sync()` for live refresh and `tab:become()` to swap to settings. `run_settings_fzf()` uses `enter:execute-silent()+reload()` for toggle-and-refresh.
-- **main** (~line 619): Dispatches internal commands (`--picker-lines`, `--settings-lines`, `--toggle`, `--settings`) used by fzf subprocess calls, then falls through to the interactive picker.
+- **Session history** (~line 186): `get_history_sessions()` reads `~/.claude/history.jsonl` for session metadata, falls back to scanning `~/.claude/projects/*/` JSONL files. `get_session_tail()` reads the last 32KB (binary mode) of a session file to extract the latest message and turn state.
+- **Display** (~line 350): Builds fzf input lines grouped into sections (new session, current dir, other) via `_render_live_block()` and `_render_history_block()` helpers. `build_settings_lines()` builds the settings panel.
+- **fzf wiring** (~line 478): `run_fzf()` launches fzf with `load:reload-sync()` for live refresh and `tab:become()` to swap to settings. `run_settings_fzf()` uses `enter:execute-silent()+reload()` for toggle-and-refresh.
+- **main** (~line 547): Dispatches internal commands (`--picker-lines`, `--settings-lines`, `--toggle`, `--settings`, `--update`) used by fzf subprocess calls, then falls through to the interactive picker.
 
 ## Key patterns
 
