@@ -201,7 +201,7 @@ def create_and_enter_tmux(project_dir, claude_args, claude_sid=None):
 
 def encode_project_path(path):
     """Encode a path the way Claude Code names project directories."""
-    return path.replace("\\", "/").replace("/", "-").replace(" ", "-").replace("~", "-")
+    return path.replace("\\", "/").replace("/", "-").replace(":", "-").replace(" ", "-").replace("~", "-")
 
 
 def extract_message_text(entry):
@@ -335,6 +335,10 @@ def get_history_sessions():
                 try:
                     cwd = parse_session_cwd(session_file)
                     if cwd:
+                        # Skip sessions whose project path doesn't exist locally
+                        # (e.g. /app from Docker containers)
+                        if not Path(cwd).exists():
+                            continue
                         sessions[sid] = {
                             "project": cwd,
                             "last_ts": session_file.stat().st_mtime * 1000,
@@ -513,6 +517,7 @@ def _run_fzf(lines, header, extra_binds=None):
             input="\n".join(lines),
             stdout=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
         )
     except FileNotFoundError:
         print("fzf is required.")
@@ -527,17 +532,23 @@ def _run_fzf(lines, header, extra_binds=None):
     if result.returncode != 0 or not result.stdout.strip():
         return None, None
 
-    out = result.stdout.strip().split("\n")
-    pressed = out[0] if out else ""
-    selected = out[1].split("\t")[0] if len(out) > 1 else ""
+    # fzf --expect outputs: line1 = pressed key (empty for Enter), line2 = selected line
+    # Don't strip leading newlines — an empty first line means Enter was pressed
+    out = result.stdout.rstrip().split("\n")
+    pressed = out[0].strip() if out else ""
+    selected = out[1].strip().split("\t")[0] if len(out) > 1 else ""
     return pressed, selected
 
 
 def run_picker_loop():
     """Main UI loop: sessions picker <-> settings panel, all in Python."""
-    script = shlex.quote(os.path.abspath(sys.argv[0]))
-    python = shlex.quote(sys.executable)
-    reload_cmd = f"load:reload-sync({python} {script} --picker-lines --delay)"
+    script = os.path.abspath(sys.argv[0])
+    python = sys.executable
+    if IS_WINDOWS:
+        # fzf on Windows runs reload commands via cmd /c, which needs double quotes
+        reload_cmd = f'load:reload-sync("{python}" "{script}" --picker-lines --delay)'
+    else:
+        reload_cmd = f"load:reload-sync({shlex.quote(python)} {shlex.quote(script)} --picker-lines --delay)"
 
     mode = "sessions"
 
