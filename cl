@@ -38,12 +38,35 @@ CLAUDE_BIN = "claude"
 TMUX_PREFIX = "cl/"
 TMUX_AVAILABLE = not IS_WINDOWS and which("tmux") is not None
 
-# Toggle settings: key -> (label, description, default)
-TOGGLE_DEFS = {
-    "use_tmux": ("tmux wrapping", "Wrap sessions in tmux for SSH attach", True),
-}
 
-DEFAULT_FLAGS = ["--dangerously-skip-permissions"]
+def _reset_terminal():
+    """Reset terminal modes that fzf leaves enabled on Windows.
+
+    fzf enables mouse tracking and focus reporting but doesn't always
+    clean up on Windows Terminal.  Without this, the next program
+    (Claude Code) inherits the state and [I/[O/mouse sequences leak
+    into its input as visible garbage.
+
+    Writes directly via os.write to bypass Python's I/O buffering.
+    """
+    reset = (
+        "\x1b[?1000l"  # disable mouse click tracking
+        "\x1b[?1002l"  # disable mouse button tracking
+        "\x1b[?1003l"  # disable all mouse motion tracking
+        "\x1b[?1006l"  # disable SGR extended mouse mode
+        "\x1b[?1004l"  # disable focus reporting
+        "\x1b[?25h"    # ensure cursor visible
+    )
+    try:
+        os.write(2, reset.encode())
+    except OSError:
+        pass
+
+# Setting definitions: key -> (label, description, default)
+SETTING_DEFS = {
+    "use_tmux": ("tmux wrapping", "Wrap sessions in tmux for SSH attach", True),
+    "skip_permissions": ("skip permissions", "--dangerously-skip-permissions flag", True),
+}
 
 
 # --- settings ---
@@ -57,18 +80,13 @@ def load_settings():
     global _settings_cache
     if _settings_cache is not None:
         return _settings_cache
-    defaults = {k: v[2] for k, v in TOGGLE_DEFS.items()}
-    defaults["flags"] = DEFAULT_FLAGS
+    defaults = {k: v[2] for k, v in SETTING_DEFS.items()}
     if not SETTINGS_FILE.exists():
         _settings_cache = defaults
         return defaults
     try:
         with open(SETTINGS_FILE) as f:
             saved = json.loads(f.read())
-        # Migrate old skip_permissions toggle -> flags list
-        if "skip_permissions" in saved and "flags" not in saved:
-            saved["flags"] = DEFAULT_FLAGS if saved.pop("skip_permissions") else []
-            save_settings({**defaults, **saved})
         _settings_cache = {**defaults, **saved}
     except (json.JSONDecodeError, OSError):
         _settings_cache = defaults
@@ -88,7 +106,10 @@ def use_tmux():
 
 
 def get_base_flags():
-    return list(load_settings().get("flags", DEFAULT_FLAGS))
+    flags = []
+    if load_settings().get("skip_permissions", True):
+        flags.append("--dangerously-skip-permissions")
+    return flags
 
 
 # --- launch (no tmux) ---
@@ -99,7 +120,10 @@ def launch_claude(project_dir, claude_args):
     os.chdir(project_dir)
     cmd = [CLAUDE_BIN] + get_base_flags() + list(claude_args)
     if IS_WINDOWS:
-        sys.exit(subprocess.call(cmd))
+        _reset_terminal()
+        rc = subprocess.call(cmd)
+        _reset_terminal()
+        sys.exit(rc)
     else:
         os.execvp(CLAUDE_BIN, cmd)
 
@@ -201,7 +225,7 @@ def create_and_enter_tmux(project_dir, claude_args, claude_sid=None):
 
 def encode_project_path(path):
     """Encode a path the way Claude Code names project directories."""
-    return path.replace("\\", "/").replace("/", "-").replace(":", "-").replace(" ", "-").replace("~", "-")
+    return path.replace("\\", "/").replace("/", "-").replace(" ", "-").replace("~", "-")
 
 
 def extract_message_text(entry):
@@ -335,10 +359,6 @@ def get_history_sessions():
                 try:
                     cwd = parse_session_cwd(session_file)
                     if cwd:
-                        # Skip sessions whose project path doesn't exist locally
-                        # (e.g. /app from Docker containers)
-                        if not Path(cwd).exists():
-                            continue
                         sessions[sid] = {
                             "project": cwd,
                             "last_ts": session_file.stat().st_mtime * 1000,
@@ -479,45 +499,39 @@ def build_settings_lines():
     """Build fzf lines for the settings panel."""
     settings = load_settings()
     lines = []
-
-    # Toggle settings
-    for key, (label, desc, default) in TOGGLE_DEFS.items():
+    for key, (label, desc, default) in SETTING_DEFS.items():
         val = settings.get(key, default)
         if key == "use_tmux" and not TMUX_AVAILABLE:
             indicator = "\x1b[2m---\x1b[0m"
             note = f"\x1b[2m{label}  (tmux not installed)\x1b[0m"
         else:
-            indicator = "\x1b[32m ON\x1b[0m" if val else "\x1b[31mOFF\x1b[0m"
+            on = val
+            indicator = "\x1b[32m ON\x1b[0m" if on else "\x1b[31mOFF\x1b[0m"
             note = f"{label}  \x1b[2m{desc}\x1b[0m"
         lines.append(f"SET:{key}\t  [{indicator}]  {note}")
-
-    # Flags (freeform)
-    flags = settings.get("flags", DEFAULT_FLAGS)
-    flags_str = " ".join(flags) if flags else "(none)"
-    lines.append(f"EDIT:flags\t  \x1b[33mflags\x1b[0m  {flags_str}  \x1b[2m[enter: edit]\x1b[0m")
-
     return lines
 
 
-def _run_fzf(lines, header, extra_binds=None):
-    """Run fzf with --expect=tab, return (pressed_key, selected_key) or (None, None)."""
-    fzf_args = [
-        "fzf", "--ansi", "--no-sort",
-        "--header", header,
-        "--delimiter", "\t", "--with-nth", "2..",
-        "--height", "~50%", "--reverse",
-        "--expect", "tab",
-    ]
-    for bind in (extra_binds or []):
-        fzf_args += ["--bind", bind]
+def run_fzf(lines):
+    """Show fzf session picker with live reload, return selected key or None."""
+    script = shlex.quote(os.path.abspath(sys.argv[0]))
+    python = shlex.quote(sys.executable)
+    reload_cmd = f"{python} {script} --picker-lines --delay"
+    settings_cmd = f"{python} {script} --settings"
 
     try:
         result = subprocess.run(
-            fzf_args,
+            [
+                "fzf", "--ansi", "--no-sort",
+                "--header", " Sessions  [tab: settings]",
+                "--delimiter", "\t", "--with-nth", "2..",
+                "--height", "~50%", "--reverse",
+                "--bind", f"load:reload-sync({reload_cmd})",
+                "--bind", f"tab:become({settings_cmd})",
+            ],
             input="\n".join(lines),
             stdout=subprocess.PIPE,
             text=True,
-            encoding="utf-8",
         )
     except FileNotFoundError:
         print("fzf is required.")
@@ -529,82 +543,36 @@ def _run_fzf(lines, header, extra_binds=None):
             print("  https://github.com/junegunn/fzf#installation")
         sys.exit(1)
 
-    if result.returncode != 0 or not result.stdout.strip():
-        return None, None
-
-    # fzf --expect outputs: line1 = pressed key (empty for Enter), line2 = selected line
-    # Don't strip leading newlines — an empty first line means Enter was pressed
-    out = result.stdout.rstrip().split("\n")
-    pressed = out[0].strip() if out else ""
-    selected = out[1].strip().split("\t")[0] if len(out) > 1 else ""
-    return pressed, selected
-
-
-def run_picker_loop():
-    """Main UI loop: sessions picker <-> settings panel, all in Python."""
-    script = os.path.abspath(sys.argv[0])
-    python = sys.executable
     if IS_WINDOWS:
-        # fzf on Windows runs reload commands via cmd /c, which needs double quotes
-        reload_cmd = f'load:reload-sync("{python}" "{script}" --picker-lines --delay)'
-    else:
-        reload_cmd = f"load:reload-sync({shlex.quote(python)} {shlex.quote(script)} --picker-lines --delay)"
+        _reset_terminal()
 
-    mode = "sessions"
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return result.stdout.strip().split("\t")[0]
 
-    while True:
-        if mode == "sessions":
-            history = get_history_sessions()
-            live = get_live_sessions()
-            cwd = os.getcwd()
-            lines = build_picker_lines(live, history, cwd)
 
-            pressed, key = _run_fzf(
-                lines,
-                " Sessions  [tab: settings]",
-                extra_binds=[reload_cmd],
-            )
+def run_settings_fzf():
+    """Show fzf settings panel. Returns to session picker on Tab."""
+    script = shlex.quote(os.path.abspath(sys.argv[0]))
+    python = shlex.quote(sys.executable)
 
-            if pressed is None:
-                return None  # Esc/ctrl-c
-            if pressed == "tab":
-                mode = "settings"
-                continue
-            return key  # session key selected
-
-        elif mode == "settings":
-            global _settings_cache
-            _settings_cache = None
-
-            pressed, selected = _run_fzf(
-                build_settings_lines(),
-                " Settings  [tab: sessions]  [enter: toggle/edit]",
-            )
-
-            if pressed is None:
-                return None  # Esc/ctrl-c
-            if pressed == "tab":
-                mode = "sessions"
-                continue
-
-            if selected.startswith("SET:"):
-                key = selected.removeprefix("SET:")
-                if key in TOGGLE_DEFS and not (key == "use_tmux" and not TMUX_AVAILABLE):
-                    settings = load_settings()
-                    settings[key] = not settings.get(key, TOGGLE_DEFS[key][2])
-                    save_settings(settings)
-                # stay in settings mode
-
-            elif selected.startswith("EDIT:"):
-                SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-                if not SETTINGS_FILE.exists():
-                    save_settings(load_settings())
-                editor = os.environ.get("EDITOR", "vi" if not IS_WINDOWS else "notepad")
-                subprocess.call([editor, str(SETTINGS_FILE)])
-                # stay in settings mode
-
-            else:
-                return None
+    try:
+        subprocess.run(
+            [
+                "fzf", "--ansi", "--no-sort",
+                "--header", " Settings  [tab: sessions]  [enter: toggle]",
+                "--delimiter", "\t", "--with-nth", "2..",
+                "--height", "~50%", "--reverse",
+                "--bind", f"tab:become({python} {script})",
+                "--bind", f"enter:execute-silent({python} {script} --toggle {{1}})+reload({python} {script} --settings-lines)",
+            ],
+            input="\n".join(build_settings_lines()),
+            text=True,
+        )
+    except FileNotFoundError:
+        pass
+    if IS_WINDOWS:
+        _reset_terminal()
 
 
 # --- main ---
@@ -635,6 +603,22 @@ def main():
         print("\n".join(build_settings_lines()))
         return
 
+    # Internal: toggle a setting
+    if "--toggle" in args:
+        idx = args.index("--toggle")
+        if idx + 1 < len(args):
+            key = args[idx + 1].removeprefix("SET:")
+            if key in SETTING_DEFS and not (key == "use_tmux" and not TMUX_AVAILABLE):
+                settings = load_settings()
+                settings[key] = not settings.get(key, SETTING_DEFS[key][2])
+                save_settings(settings)
+        return
+
+    # Settings panel
+    if "--settings" in args:
+        run_settings_fzf()
+        return
+
     # Self-update via git pull
     if "--update" in args:
         repo_dir = Path(__file__).resolve().parent
@@ -659,12 +643,13 @@ def main():
         start_session(os.getcwd(), [])
         return
 
-    key = run_picker_loop()
+    cwd = os.getcwd()
+    key = run_fzf(build_picker_lines(live, history, cwd))
 
     if key is None or key == "SEP":
         sys.exit(0)
     elif key == "NEW":
-        start_session(os.getcwd(), [])
+        start_session(cwd, [])
     elif key.startswith("TMUX:"):
         enter_tmux(key[5:])
     else:
